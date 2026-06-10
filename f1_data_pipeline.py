@@ -31,13 +31,29 @@ import sys
 import time
 import warnings
 
+# Raise recursion limit: FastF1's _add_first_lap_time_from_ergast can recurse
+# deeply on older seasons (2021/2022) under Python 3.14.
+sys.setrecursionlimit(10000)
+
 subprocess.run([sys.executable, "-m", "pip", "install", "fastf1"], check=True)
 
 import fastf1
+import fastf1.core as _ff1core
 from fastf1.exceptions import RateLimitExceededError
 import numpy as np
 import pandas as pd
 from pathlib import Path
+
+# ── Monkey-patch: silence broken Ergast first-lap fetch ────────────────────────
+# FastF1's _add_first_lap_time_from_ergast raises an AttributeError on 2021/2022
+# data (session._laps not set at call time), which corrupts session state and
+# causes session.laps to raise DataNotLoadedError for the entire race.
+# Our rolling average starts at lap 3 so we never need the first-lap Ergast
+# correction anyway — replacing with a no-op is safe and complete.
+def _noop_first_lap(self, *args, **kwargs):
+    pass
+
+_ff1core.Session._add_first_lap_time_from_ergast = _noop_first_lap
 
 # ── Logging setup ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -54,8 +70,8 @@ CACHE_DIR.mkdir(exist_ok=True)
 fastf1.Cache.enable_cache(str(CACHE_DIR))
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-SEASONS = range(2023, 2024)      # 2023 only
-OUTPUT_CSV = "f1_pit_data_2023.csv"
+SEASONS = [2021, 2023]           # 2022 excluded (FastF1 data unavailable)
+OUTPUT_CSV = "f1_pit_data_2021_2023.csv"
 
 COMPOUND_MAP = {"SOFT": 0, "MEDIUM": 1, "HARD": 2}
 
@@ -343,12 +359,12 @@ def process_race(session) -> pd.DataFrame:
     Returns a feature DataFrame or an empty DataFrame on failure/no data.
     """
     try:
-        _load_with_retry(session, laps=True, telemetry=False, weather=False, messages=False)
+        _load_with_retry(session, laps=True, telemetry=False, weather=True, messages=False)
+        laps = session.laps          # keep inside try — broken sessions raise here
     except Exception as exc:
         log.warning("  Could not load session: %s", exc)
         return pd.DataFrame()
 
-    laps = session.laps
     if laps is None or laps.empty:
         log.warning("  No lap data found.")
         return pd.DataFrame()
@@ -377,6 +393,37 @@ def process_race(session) -> pd.DataFrame:
     # ── Undercut threat ───────────────────────────────────────────────────────
     laps = compute_undercut_threat(laps)
 
+    # ── Attach weather data (track_temp, rainfall) ───────────────────────────
+    # Merge the nearest weather sample (by session-elapsed Time) onto every lap.
+    # weather_data.Time is a timedelta from session start; so is laps.Time.
+    # merge_asof(direction='backward') picks the most recent reading before/at
+    # each lap's end time — safe even when weather rows are sparse.
+    try:
+        wdf = session.weather_data
+        if wdf is not None and not wdf.empty and "Time" in wdf.columns:
+            wdf_clean = (
+                wdf[["Time", "TrackTemp", "Rainfall"]]
+                .copy()
+                .sort_values("Time")
+                .rename(columns={"TrackTemp": "track_temp", "Rainfall": "rainfall"})
+            )
+            # Rainfall can be bool or 0/1 float — normalise to int
+            wdf_clean["rainfall"] = wdf_clean["rainfall"].astype(float).astype(int)
+            laps_sorted = laps.sort_values("Time")
+            laps = pd.merge_asof(
+                laps_sorted,
+                wdf_clean,
+                on="Time",
+                direction="backward",
+            )
+        else:
+            laps["track_temp"] = np.nan
+            laps["rainfall"]   = np.nan
+    except Exception as _wexc:
+        log.warning("  Weather merge skipped: %s", _wexc)
+        laps["track_temp"] = np.nan
+        laps["rainfall"]   = np.nan
+
     # ── Per-driver feature extraction ─────────────────────────────────────────
     year = session.event["EventDate"].year
     round_num = int(session.event["RoundNumber"])
@@ -389,11 +436,12 @@ def process_race(session) -> pd.DataFrame:
         if feat_df.empty:
             continue
 
-        feat_df["driver"]     = drv
-        feat_df["year"]       = year
-        feat_df["round"]      = round_num
-        feat_df["event_name"] = event_name
-        feat_df["circuit_id"] = round_num - 1   # 0-based calendar-order encoding
+        feat_df["driver"]          = drv
+        feat_df["year"]            = year
+        feat_df["regulation_era"]  = 0 if year <= 2021 else 1
+        feat_df["round"]           = round_num
+        feat_df["event_name"]      = event_name
+        # circuit_id is assigned in run_pipeline after all seasons are known
         all_driver_dfs.append(feat_df)
 
     if not all_driver_dfs:
@@ -427,7 +475,8 @@ def process_race(session) -> pd.DataFrame:
 
     # ── Select and rename final columns ───────────────────────────────────────
     col_map = {
-        "year":             "year",
+        "year":             "season",
+        "regulation_era":   "regulation_era",
         "round":            "round",
         "event_name":       "event_name",
         "driver":           "driver",
@@ -442,7 +491,8 @@ def process_race(session) -> pd.DataFrame:
         "gap_behind_s":     "gap_behind",
         "race_completion":  "race_completion",
         "undercut_threat":  "undercut_threat",
-        "circuit_id":       "circuit_id",
+        "track_temp":       "track_temp",
+        "rainfall":         "rainfall",
         "pit_loss_time":    "pit_loss_time",
         "pitted_next_lap":  "pitted_next_lap",
     }
@@ -459,7 +509,6 @@ def process_race(session) -> pd.DataFrame:
 def run_pipeline():
     all_races = []
     total_errors = 0
-    circuit_map: dict[int, str] = {}   # circuit_id → event_name
 
     for year in SEASONS:
         log.info("=" * 60)
@@ -527,29 +576,88 @@ def run_pipeline():
     final_df.to_csv(OUTPUT_CSV, index=False)
     log.info("Done ✓")
 
-    # ── Print circuit mapping ───────────────────────────────────────────────
+    # ── Per-season summary ───────────────────────────────────────────────
+    season_col = "season" if "season" in final_df.columns else "year"
     print()
-    print("  CIRCUIT ID MAPPING (circuit_id → event_name)")
-    print("  " + "-" * 44)
-    for cid in sorted(circuit_map):
-        print(f"  {cid:>3}  {circuit_map[cid]}")
+    print("  SEASON SUMMARY")
+    print("  " + "-" * 52)
+    print(f"  {'Season':<8}  {'Rows':>8}  {'Pit Events':>12}  {'Pit Rate':>10}")
+    print("  " + "-" * 52)
+    for yr, grp in final_df.groupby(season_col):
+        pits = int(grp["pitted_next_lap"].sum())
+        rate = 100 * grp["pitted_next_lap"].mean()
+        print(f"  {int(yr):<8}  {len(grp):>8,}  {pits:>12,}  {rate:>9.2f}%")
+    print("  " + "-" * 52)
+    pits_total = int(final_df["pitted_next_lap"].sum())
+    rate_total = 100 * final_df["pitted_next_lap"].mean()
+    print(f"  {'TOTAL':<8}  {len(final_df):>8,}  {pits_total:>12,}  {rate_total:>9.2f}%")
+    print("  " + "-" * 52)
     print()
 
-    # ── Print pit loss time per circuit ───────────────────────────────────
-    if "pit_loss_time" in final_df.columns and "circuit_id" in final_df.columns:
-        plt_map = (
-            final_df[["circuit_id", "event_name", "pit_loss_time"]]
-            .drop_duplicates(subset="circuit_id")
-            .sort_values("circuit_id")
-        )
-        print("  PIT LOSS TIME PER CIRCUIT")
-        print("  " + "-" * 50)
-        print(f"  {'ID':>3}  {'Event':<32}  {'Pit Loss (s)':>12}")
-        print("  " + "-" * 50)
-        for _, r in plt_map.iterrows():
-            print(f"  {int(r['circuit_id']):>3}  {r['event_name']:<32}  {r['pit_loss_time']:>12.2f}")
-        print("  " + "-" * 50)
+    # ── Regulation era breakdown ────────────────────────────────────────────
+    if "regulation_era" in final_df.columns:
+        era_labels = {0: "Pre-2022 (0)", 1: "2022+    (1)"}
+        print("  REGULATION ERA BREAKDOWN")
+        print("  " + "-" * 52)
+        print(f"  {'Era':<14}  {'Rows':>8}  {'Pit Events':>12}  {'Pit Rate':>10}")
+        print("  " + "-" * 52)
+        for era, grp in final_df.groupby("regulation_era"):
+            pits = int(grp["pitted_next_lap"].sum())
+            rate = 100 * grp["pitted_next_lap"].mean()
+            label = era_labels.get(int(era), str(era))
+            print(f"  {label:<14}  {len(grp):>8,}  {pits:>12,}  {rate:>9.2f}%")
+        print("  " + "-" * 52)
         print()
+
+    # ── Stable cross-season circuit_id (alphabetical by event_name) ──────────
+    all_events  = sorted(final_df["event_name"].unique())
+    name_to_id  = {name: idx for idx, name in enumerate(all_events)}
+    final_df["circuit_id"] = final_df["event_name"].map(name_to_id)
+
+    # ── Cross-season pit_loss_time (mean per circuit, NaN → global mean) ─────
+    global_mean_pit_loss = final_df["pit_loss_time"].mean()
+    circuit_pit_loss = final_df.groupby("event_name")["pit_loss_time"].mean()
+    final_df["pit_loss_time"] = (
+        final_df["event_name"].map(circuit_pit_loss).fillna(global_mean_pit_loss)
+    )
+
+    # Re-save with corrected columns
+    final_df.to_csv(OUTPUT_CSV, index=False)
+    log.info("Resaved with stable circuit_id and pit_loss_time ✓")
+
+    # ── Combined stable mapping table ─────────────────────────────────────────
+    mapping_df = (
+        final_df[["circuit_id", "event_name", "pit_loss_time"]]
+        .drop_duplicates(subset="circuit_id")
+        .sort_values("circuit_id")
+        .reset_index(drop=True)
+    )
+    print("  STABLE CIRCUIT MAPPING  (alphabetical, cross-season averaged)")
+    print("  " + "-" * 62)
+    print(f"  {'ID':>3}  {'Event':<36}  {'Pit Loss (s)':>12}")
+    print("  " + "-" * 62)
+    for _, r in mapping_df.iterrows():
+        print(f"  {int(r['circuit_id']):>3}  {r['event_name']:<36}  {r['pit_loss_time']:>12.2f}")
+    print("  " + "-" * 62)
+    print()
+
+    # ── Weather column stats ───────────────────────────────────────────────
+    print("  WEATHER COLUMN STATS")
+    print("  " + "-" * 62)
+    for col, label in [("track_temp", "track_temp (°C)"), ("rainfall", "rainfall (0/1)")]:
+        if col in final_df.columns:
+            s = final_df[col]
+            nulls = int(s.isna().sum())
+            pct   = 100 * nulls / len(s)
+            print(f"  {label:<20}  nulls={nulls:>5} ({pct:.1f}%)  "
+                  f"min={s.min():.1f}  max={s.max():.1f}  "
+                  f"mean={s.mean():.2f}  std={s.std():.2f}")
+            if col == "rainfall":
+                wet = int((s == 1).sum())
+                print(f"  {'':20}  wet laps = {wet:,}  "
+                      f"({100*wet/max(len(s)-nulls,1):.1f}% of non-null)")
+    print("  " + "-" * 62)
+    print()
 
     return final_df
 

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-F1 Pit Stop Predictor — powered by pit_model_v4.json
+F1 Pit Stop Predictor — powered by pit_model_v8.json
 ======================================================
 Interactive CLI that takes a current race state as input and outputs
-a pit stop recommendation using the trained XGBoost v4 model.
+a pit stop recommendation using the trained XGBoost v8 model
+(Optuna-tuned, 14 features including track_temp and rainfall).
 
 Usage:
     python3 pit_predictor.py
@@ -15,56 +16,70 @@ import xgboost as xgb
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-THRESHOLD = 0.645   # F1-maximising threshold from full PR curve
+THRESHOLD = 0.65    # F1-maximising threshold from v8 PR curve
 
+# Stable alphabetical circuit mapping (cross-season, 28 circuits)
 CIRCUIT_NAMES = {
-     0: "Bahrain Grand Prix",
-     1: "Saudi Arabian Grand Prix",
-     2: "Australian Grand Prix",
+     0: "Abu Dhabi Grand Prix",
+     1: "Australian Grand Prix",
+     2: "Austrian Grand Prix",
      3: "Azerbaijan Grand Prix",
-     4: "Miami Grand Prix",
-     5: "Monaco Grand Prix",
-     6: "Spanish Grand Prix",
+     4: "Bahrain Grand Prix",
+     5: "Belgian Grand Prix",
+     6: "British Grand Prix",
      7: "Canadian Grand Prix",
-     8: "Austrian Grand Prix",
-     9: "British Grand Prix",
-    10: "Hungarian Grand Prix",
-    11: "Belgian Grand Prix",
-    12: "Dutch Grand Prix",
-    13: "Italian Grand Prix",
-    14: "Singapore Grand Prix",
-    15: "Japanese Grand Prix",
-    16: "Qatar Grand Prix",
-    17: "United States Grand Prix",
-    18: "Mexico City Grand Prix",
-    19: "São Paulo Grand Prix",
-    20: "Las Vegas Grand Prix",
-    21: "Abu Dhabi Grand Prix",
+     8: "Dutch Grand Prix",
+     9: "Emilia Romagna Grand Prix",
+    10: "French Grand Prix",
+    11: "Hungarian Grand Prix",
+    12: "Italian Grand Prix",
+    13: "Japanese Grand Prix",
+    14: "Las Vegas Grand Prix",
+    15: "Mexico City Grand Prix",
+    16: "Miami Grand Prix",
+    17: "Monaco Grand Prix",
+    18: "Portuguese Grand Prix",
+    19: "Qatar Grand Prix",
+    20: "Russian Grand Prix",
+    21: "Saudi Arabian Grand Prix",
+    22: "Singapore Grand Prix",
+    23: "Spanish Grand Prix",
+    24: "Styrian Grand Prix",
+    25: "São Paulo Grand Prix",
+    26: "Turkish Grand Prix",
+    27: "United States Grand Prix",
 }
 
+# Cross-season averaged pit loss times (seconds)
 PIT_LOSS_TIME = {
-     0:  3.29,
-     1:  2.40,
-     2: 14.60,
-     3:  4.54,
-     4:  4.73,
-     5: 29.42,
-     6:  4.00,
+     0:  3.39,
+     1: 14.60,
+     2:  3.58,
+     3:  4.40,
+     4:  3.01,
+     5:  4.22,
+     6: -0.37,
      7: 18.76,
-     8:  3.67,
-     9: -0.39,
-    10:  2.96,
-    11:  4.22,
-    12:  6.49,
-    13:  5.25,
-    14:  9.03,
-    15:  4.67,
-    16:  4.29,
-    17:  1.17,
-    18:  4.52,
-    19:  4.95,
-    20:  6.39,
-    21:  2.37,
+     8:  5.61,
+     9:  6.35,
+    10: 19.78,
+    11:  2.74,
+    12:  5.00,
+    13:  4.67,
+    14:  6.39,
+    15:  3.69,
+    16:  5.01,
+    17: 22.20,
+    18:  3.93,
+    19: 13.71,
+    20: 12.23,
+    21:  5.09,
+    22:  9.03,
+    23:  3.92,
+    24:  4.87,
+    25:  4.62,
+    26:  6.68,
+    27:  1.62,
 }
 
 COMPOUND_NAMES = {0: "SOFT", 1: "MEDIUM", 2: "HARD"}
@@ -82,6 +97,8 @@ FEATURE_COLS = [
     "undercut_threat",
     "circuit_id",
     "pit_loss_time",
+    "track_temp",
+    "rainfall",
 ]
 
 # ── Styling helpers ───────────────────────────────────────────────────────────
@@ -145,12 +162,12 @@ def choose_circuit():
     for cid, name in CIRCUIT_NAMES.items():
         print(c(f"    {cid:>2}", CYAN) + c(f"  {name}", DIM))
     print()
-    return int(prompt("Circuit ID (0–21)", int, min_=0, max_=21))
+    return int(prompt("Circuit ID (0–27)", int, min_=0, max_=27))
 
 # ── Main prediction flow ──────────────────────────────────────────────────────
 
 def collect_inputs():
-    header("F1 PIT STOP PREDICTOR  ·  v4 MODEL")
+    header("F1 PIT STOP PREDICTOR  ·  v8 MODEL")
 
     print(c("\n  Enter the current race state below.", DIM))
     print(c("  Type 999 for gap fields when leading / last place.\n", DIM))
@@ -184,6 +201,10 @@ def collect_inputs():
     else:
         behind_tire_age = prompt("Behind car's tire age (laps)", float, min_=0)
 
+    section("Weather Conditions")
+    track_temp = prompt("Track surface temperature (°C)", float, min_=-10, max_=80)
+    rainfall   = prompt("Rainfall  (0 = dry  1 = wet)", int, choices=[0, 1])
+
     return {
         "circuit_id":      circuit_id,
         "circuit_name":    circuit_name,
@@ -198,6 +219,8 @@ def collect_inputs():
         "gap_ahead":       gap_ahead,
         "gap_behind":      gap_behind,
         "behind_tire_age": behind_tire_age,
+        "track_temp":      track_temp,
+        "rainfall":        rainfall,
     }
 
 
@@ -225,6 +248,8 @@ def build_feature_vector(inp):
         "undercut_threat":  undercut_threat,
         "circuit_id":       inp["circuit_id"],
         "pit_loss_time":    inp["pit_loss_time"],
+        "track_temp":       inp["track_temp"],
+        "rainfall":         inp["rainfall"],
     }
     return features, race_completion, tire_age_squared, undercut_threat
 
@@ -253,6 +278,10 @@ def print_result(inp, features, race_completion, tire_age_sq, undercut_threat, p
     row("Gap ahead",        f"{inp['gap_ahead']:.3f}" if inp["gap_ahead"] < 999 else "LEADING")
     row("Gap behind",       f"{inp['gap_behind']:.3f}" if inp["gap_behind"] < 999 else "LAST")
     row("Undercut threat",  f"{undercut_threat:.4f}")
+
+    section("Weather")
+    row("Track temp",       f"{inp['track_temp']:.1f}", "°C")
+    row("Rainfall",         "WET 🌧" if inp["rainfall"] == 1 else "DRY ☀")
 
     # ── Recommendation ────────────────────────────────────────────────────────
     pct = probability * 100
@@ -317,14 +346,14 @@ def main():
     # Load model once
     try:
         model = xgb.XGBClassifier()
-        model.load_model("pit_model_v4.json")
+        model.load_model("pit_model_v8.json")
     except Exception as e:
-        print(c(f"\n  ✗ Could not load pit_model_v4.json: {e}", RED))
-        print(c("  Make sure pit_model_v4.json is in the same directory.\n", DIM))
+        print(c(f"\n  ✗ Could not load pit_model_v8.json: {e}", RED))
+        print(c("  Make sure pit_model_v8.json is in the same directory.\n", DIM))
         sys.exit(1)
 
-    print(c("\n  Model loaded: pit_model_v4.json  ✓", GREEN))
-    print(c(f"  Features : 12    Threshold : {THRESHOLD}", DIM))
+    print(c("\n  Model loaded: pit_model_v8.json  ✓", GREEN))
+    print(c(f"  Features : 14    Threshold : {THRESHOLD}", DIM))
 
     while True:
         try:
