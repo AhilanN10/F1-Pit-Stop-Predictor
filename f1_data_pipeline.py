@@ -270,6 +270,70 @@ def compute_undercut_threat(laps: pd.DataFrame) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Opponent context feature computation
+# ──────────────────────────────────────────────────────────────────────────────
+
+def compute_opponent_features(laps: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add four opponent-context columns to the all-driver laps dataframe.
+
+    For each (lap, driver) row, look up the car directly ahead (Position - 1)
+    and directly behind (Position + 1) on the same lap:
+
+      ahead_compound   0=Soft 1=Medium 2=Hard  -1 if leading (no car ahead)
+      ahead_tire_age   TyreLife of car ahead,  -1 if leading
+      behind_compound  same encoding,           -1 if last
+      behind_tire_age  TyreLife of car behind,  -1 if last
+
+    Requires columns: LapNumber, Position, TyreLife, Compound.
+    Uses the same COMPOUND_MAP as the rest of the pipeline.
+    """
+    laps = laps.copy()
+    for col in ("ahead_compound", "ahead_tire_age",
+                "behind_compound", "behind_tire_age"):
+        laps[col] = -1.0
+
+    required = {"LapNumber", "Position", "TyreLife", "Compound"}
+    if not required.issubset(laps.columns):
+        return laps
+
+    for _lap_num, grp in laps.groupby("LapNumber"):
+        grp = grp.dropna(subset=["Position"]).sort_values("Position")
+        if grp.empty:
+            continue
+
+        # Build Position → (compound_code, tire_age) lookup for this lap
+        pos_to_compound = {}
+        pos_to_age      = {}
+        for idx, row in grp.iterrows():
+            raw_cmp = str(row["Compound"]).upper() if pd.notna(row["Compound"]) else ""
+            code    = COMPOUND_MAP.get(raw_cmp, -1)
+            age     = float(row["TyreLife"]) if pd.notna(row["TyreLife"]) else -1.0
+            pos = row["Position"]
+            pos_to_compound[pos] = code
+            pos_to_age[pos]      = age
+
+        for idx, row in grp.iterrows():
+            own_pos = row["Position"]
+
+            # Car ahead = Position - 1  (P1 has no car ahead → sentinel -1)
+            ahead_pos = own_pos - 1
+            if ahead_pos >= 1 and ahead_pos in pos_to_compound:
+                laps.at[idx, "ahead_compound"] = pos_to_compound[ahead_pos]
+                laps.at[idx, "ahead_tire_age"] = pos_to_age[ahead_pos]
+            # else stays -1 (leader)
+
+            # Car behind = Position + 1  (last car has no car behind → sentinel -1)
+            behind_pos = own_pos + 1
+            if behind_pos in pos_to_compound:
+                laps.at[idx, "behind_compound"] = pos_to_compound[behind_pos]
+                laps.at[idx, "behind_tire_age"] = pos_to_age[behind_pos]
+            # else stays -1 (last place)
+
+    return laps
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Per-driver feature extraction
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -393,6 +457,9 @@ def process_race(session) -> pd.DataFrame:
     # ── Undercut threat ───────────────────────────────────────────────────────
     laps = compute_undercut_threat(laps)
 
+    # ── Opponent context (ahead/behind compound + tire age) ───────────────────
+    laps = compute_opponent_features(laps)
+
     # ── Attach weather data (track_temp, rainfall) ───────────────────────────
     # Merge the nearest weather sample (by session-elapsed Time) onto every lap.
     # weather_data.Time is a timedelta from session start; so is laps.Time.
@@ -490,11 +557,15 @@ def process_race(session) -> pd.DataFrame:
         "gap_ahead_s":      "gap_ahead",
         "gap_behind_s":     "gap_behind",
         "race_completion":  "race_completion",
-        "undercut_threat":  "undercut_threat",
-        "track_temp":       "track_temp",
-        "rainfall":         "rainfall",
-        "pit_loss_time":    "pit_loss_time",
-        "pitted_next_lap":  "pitted_next_lap",
+        "undercut_threat":   "undercut_threat",
+        "ahead_compound":    "ahead_compound",
+        "ahead_tire_age":    "ahead_tire_age",
+        "behind_compound":   "behind_compound",
+        "behind_tire_age":   "behind_tire_age",
+        "track_temp":        "track_temp",
+        "rainfall":          "rainfall",
+        "pit_loss_time":     "pit_loss_time",
+        "pitted_next_lap":   "pitted_next_lap",
     }
     available = {k: v for k, v in col_map.items() if k in race_df.columns}
     race_df = race_df[list(available.keys())].rename(columns=available)
@@ -625,6 +696,38 @@ def run_pipeline():
     final_df.to_csv(OUTPUT_CSV, index=False)
     log.info("Resaved with stable circuit_id and pit_loss_time ✓")
 
+    # ── Expected stint length per (circuit_id, compound) ──────────────────────
+    # Identify stints by detecting tire_age drops within each (season, round, driver).
+    # Max tire_age within a stint = number of laps on that set = stint length.
+    _gkey = ["season", "round", "driver"]
+    _sdf  = final_df.sort_values(_gkey + ["lap_number"]).copy()
+    _sdf["_ta_prev"]     = _sdf.groupby(_gkey)["tire_age"].shift(1)
+    _sdf["_stint_break"] = (_sdf["tire_age"] < _sdf["_ta_prev"]).fillna(False)
+    _sdf["_stint_id"]    = _sdf.groupby(_gkey)["_stint_break"].cumsum()
+
+    _stint = (
+        _sdf.groupby(_gkey + ["_stint_id"])
+        .agg(
+            circuit_id   = ("circuit_id", "first"),
+            compound     = ("compound",   "first"),
+            stint_length = ("tire_age",   "max"),
+        )
+        .reset_index(drop=True)
+    )
+    _expected = (
+        _stint.groupby(["circuit_id", "compound"])["stint_length"]
+        .mean()
+        .reset_index()
+        .rename(columns={"stint_length": "expected_stint_length"})
+    )
+    _global_mean_sl = _expected["expected_stint_length"].mean()
+    final_df = final_df.merge(_expected, on=["circuit_id", "compound"], how="left")
+    final_df["expected_stint_length"] = final_df["expected_stint_length"].fillna(_global_mean_sl)
+
+    # Re-save again with expected_stint_length included
+    final_df.to_csv(OUTPUT_CSV, index=False)
+    log.info("Resaved with expected_stint_length ✓")
+
     # ── Combined stable mapping table ─────────────────────────────────────────
     mapping_df = (
         final_df[["circuit_id", "event_name", "pit_loss_time"]]
@@ -658,6 +761,65 @@ def run_pipeline():
                       f"({100*wet/max(len(s)-nulls,1):.1f}% of non-null)")
     print("  " + "-" * 62)
     print()
+
+    # ── Expected stint length by compound ─────────────────────────────────────
+    if "expected_stint_length" in final_df.columns:
+        print("  EXPECTED STINT LENGTH  (laps, by circuit × compound)")
+        print("  " + "-" * 70)
+        print(f"  {'ID':>3}  {'Event':<34}  {'Soft':>6}  {'Medium':>7}  {'Hard':>6}")
+        print("  " + "-" * 70)
+        _pivot = (
+            final_df[["circuit_id", "event_name", "compound", "expected_stint_length"]]
+            .drop_duplicates(subset=["circuit_id", "compound"])
+            .sort_values(["circuit_id", "compound"])
+        )
+        for cid, cgrp in _pivot.groupby("circuit_id"):
+            name = cgrp["event_name"].iloc[0]
+            vals = {int(r["compound"]): r["expected_stint_length"]
+                    for _, r in cgrp.iterrows()}
+            soft   = f"{vals[0]:.1f}" if 0 in vals else "  -  "
+            medium = f"{vals[1]:.1f}" if 1 in vals else "  -  "
+            hard   = f"{vals[2]:.1f}" if 2 in vals else "  -  "
+            print(f"  {int(cid):>3}  {name:<34}  {soft:>6}  {medium:>7}  {hard:>6}")
+        print("  " + "-" * 70)
+        print()
+        print("  GLOBAL AVERAGES BY COMPOUND")
+        print("  " + "-" * 42)
+        for code, label in [(0, "Soft  "), (1, "Medium"), (2, "Hard  ")]:
+            sub = final_df[final_df["compound"] == code]["expected_stint_length"]
+            if len(sub):
+                print(f"  {label}  mean={sub.mean():.1f}  "
+                      f"min={sub.min():.1f}  max={sub.max():.1f}")
+        print("  " + "-" * 42)
+        print()
+
+    # ── Opponent context column stats ──────────────────────────────────────────
+    OPP_COLS = [
+        ("ahead_compound",  "ahead_compound  (0/1/2/-1)"),
+        ("ahead_tire_age",  "ahead_tire_age  (laps/-1)"),
+        ("behind_compound", "behind_compound (0/1/2/-1)"),
+        ("behind_tire_age", "behind_tire_age (laps/-1)"),
+    ]
+    opp_present = [c for c, _ in OPP_COLS if c in final_df.columns]
+    if opp_present:
+        print("  OPPONENT CONTEXT COLUMN STATS")
+        print("  " + "-" * 62)
+        cmp_names = {-1: "leader/last", 0: "Soft", 1: "Medium", 2: "Hard"}
+        for col, label in OPP_COLS:
+            if col not in final_df.columns:
+                continue
+            s     = final_df[col]
+            nulls = int(s.isna().sum())
+            pct   = 100 * nulls / len(s)
+            print(f"  {label:<30}  nulls={nulls:>5} ({pct:.1f}%)  "
+                  f"min={s.min():.1f}  max={s.max():.1f}  mean={s.mean():.2f}")
+            if "compound" in col:
+                for code, name in cmp_names.items():
+                    cnt = int((s == code).sum())
+                    print(f"  {'':30}    {name:<12} = {cnt:>7,}  "
+                          f"({100*cnt/max(len(s),1):.1f}%)")
+        print("  " + "-" * 62)
+        print()
 
     return final_df
 
