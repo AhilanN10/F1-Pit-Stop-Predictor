@@ -1,4 +1,5 @@
 # F1 Pit Stop Predictor
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://f1-pit-stop-predictor.streamlit.app/)
 An ensemble machine learning system that predicts optimal pit stop windows in Formula 1 racing using real telemetry and timing data from the 2021 and 2023 seasons.
 
 ## Overview
